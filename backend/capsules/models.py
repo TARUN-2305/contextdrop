@@ -2,9 +2,20 @@ import uuid
 from django.db import models
 from django.contrib.auth.models import User
 
+class Tag(models.Model):
+    name = models.CharField(max_length=50)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='tags')
+
+    class Meta:
+        unique_together = ('name', 'user')
+
+    def __str__(self):
+        return f"{self.name} ({self.user.username})"
+
 class Capsule(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     slug = models.CharField(max_length=8, unique=True)  # short URL component
+    title = models.CharField(max_length=255, blank=True, default='')
     creator = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
     domain = models.CharField(max_length=50, default='general')  # 'legal', 'medical', 'academic', etc.
     expires_at = models.DateTimeField(null=True, blank=True)
@@ -14,6 +25,7 @@ class Capsule(models.Model):
     suggested_questions = models.TextField(blank=True, default='')
     custom_logo_url = models.TextField(blank=True, default='')  # Creator custom logo image URL
     custom_accent_color = models.CharField(max_length=7, blank=True, default='')  # Creator custom HEX code
+    tags = models.ManyToManyField(Tag, blank=True, related_name='capsules')
 
     def __str__(self):
         return f"Capsule {self.slug} ({self.domain})"

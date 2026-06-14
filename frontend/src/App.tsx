@@ -52,6 +52,7 @@ function App() {
   const [_file, setFile] = useState<File | null>(null);
   const [webUrl, setWebUrl] = useState<string>('');
   const [ttlDays, setTtlDays] = useState<number>(7);
+  const [capsuleTitle, setCapsuleTitle] = useState<string>(''); // Optional custom name
   const [password, setPassword] = useState<string>(''); // Creator set password
   const [logoUrl, setLogoUrl] = useState<string>('');
   const [accentColor, setAccentColor] = useState<string>('#00E5C0');
@@ -70,8 +71,15 @@ function App() {
   const [readerPassword, setReaderPassword] = useState<string>(''); // Reader provided password
   const [passwordError, setPasswordError] = useState<string>('');
 
-  // Dashboard Analytics
+  // Dashboard State
   const [analytics, setAnalytics] = useState<DashboardAnalytics | null>(null);
+
+  // Global Auth & Dashboard State
+  const [authToken, setAuthToken] = useState(localStorage.getItem('cd_token') || '');
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [authMode, setAuthMode] = useState<'login'|'register'>('login');
+  const [authForm, setAuthForm] = useState({username: '', password: ''});
+  const [globalCapsules, setGlobalCapsules] = useState<any[]>([]);
 
   // Voice Input states
   const [isListening, setIsListening] = useState<boolean>(false);
@@ -204,6 +212,9 @@ function App() {
     const formData = new FormData();
     formData.append('file', selectedFile);
     formData.append('ttl_days', ttlDays.toString());
+    if (capsuleTitle.trim()) {
+      formData.append('title', capsuleTitle.trim());
+    }
     if (password.trim()) {
       formData.append('password', password.trim());
     }
@@ -227,6 +238,9 @@ function App() {
     const formData = new FormData();
     formData.append('url', webUrl.trim());
     formData.append('ttl_days', ttlDays.toString());
+    if (capsuleTitle.trim()) {
+      formData.append('title', capsuleTitle.trim());
+    }
     if (password.trim()) {
       formData.append('password', password.trim());
     }
@@ -241,8 +255,14 @@ function App() {
   };
 
   const sendIngestRequest = (formData: FormData, _displayTitle: string) => {
+    const headers: Record<string, string> = {};
+    if (authToken) {
+      headers['Authorization'] = `Token ${authToken}`;
+    }
+
     fetch(`${API_URL}/api/ingest`, {
       method: 'POST',
+      headers,
       body: formData,
     })
     .then(res => {
@@ -343,14 +363,21 @@ function App() {
   };
 
   // Load Dashboard Analytics
-  const openDashboard = () => {
+  const openDashboard = (targetSlug?: string) => {
+    const slugToUse = targetSlug || capsuleSlug;
     const queryPass = password || readerPassword;
-    const capId = capsuleId || getCapsuleOwnership(capsuleSlug) || '';
-    fetch(`${API_URL}/api/capsules/${capsuleSlug}/dashboard?password=${encodeURIComponent(queryPass)}`, {
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Capsule-ID': capId
-      }
+    const capId = capsuleId || getCapsuleOwnership(slugToUse) || '';
+    
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'X-Capsule-ID': capId
+    };
+    if (authToken) {
+      headers['Authorization'] = `Token ${authToken}`;
+    }
+
+    fetch(`${API_URL}/api/capsules/${slugToUse}/dashboard?password=${encodeURIComponent(queryPass)}`, {
+      headers
     })
       .then(res => {
         if (!res.ok) throw new Error('Failed to load dashboard metrics');
@@ -387,18 +414,15 @@ function App() {
   };
 
   const startNewUpload = () => {
-    setFile(null);
-    setWebUrl('');
-    setFileName('');
+    setView('upload');
     setCapsuleSlug('');
     setCapsuleId('');
+    setCapsuleTitle('');
+    setFileName('');
     setPassword('');
-    setLogoUrl('');
-    setAccentColor('#00E5C0');
-    setCustomLogoUrl('');
     setReaderPassword('');
     setPasswordError('');
-    setView('upload');
+    setMessages([]);
     setSuggestedQuestions([]);
     setAnalytics(null);
     // Reset accent colors to defaults
@@ -410,6 +434,90 @@ function App() {
         text: "Hello! I am your ContextDrop assistant. I can answer questions about the uploaded document. What would you like to know?"
       }
     ]);
+  };
+
+  const fetchGlobalDashboard = async (token: string) => {
+    try {
+      const res = await fetch(`${API_URL}/api/user/capsules`, {
+        headers: { 'Authorization': `Token ${token}` }
+      });
+      if (!res.ok) {
+        if (res.status === 401) {
+          setAuthToken('');
+          localStorage.removeItem('cd_token');
+          setAuthModalOpen(true);
+        }
+        throw new Error('Failed to fetch capsules');
+      }
+      const data = await res.json();
+      setGlobalCapsules(data.capsules || []);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleAuthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const endpoint = authMode === 'login' ? '/api/auth/login' : '/api/auth/register';
+    try {
+      const res = await fetch(`${API_URL}${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(authForm)
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Authentication failed');
+      
+      setAuthToken(data.token);
+      localStorage.setItem('cd_token', data.token);
+      setAuthModalOpen(false);
+      showToast(authMode === 'login' ? 'Logged in successfully!' : 'Account created!');
+      
+      if (activeTab === 'dashboard') {
+        setView('global_dashboard');
+        fetchGlobalDashboard(data.token);
+      }
+    } catch (err: any) {
+      showToast(err.message);
+    }
+  };
+
+  const addTagToCapsule = async (slug: string, tag: string) => {
+    try {
+      const res = await fetch(`${API_URL}/api/capsules/${slug}/tags`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Token ${authToken}`
+        },
+        body: JSON.stringify({ tag })
+      });
+      if (res.ok) {
+        fetchGlobalDashboard(authToken);
+        showToast('Tag added');
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const removeTagFromCapsule = async (slug: string, tag: string) => {
+    try {
+      const res = await fetch(`${API_URL}/api/capsules/${slug}/tags`, {
+        method: 'DELETE',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Token ${authToken}`
+        },
+        body: JSON.stringify({ tag })
+      });
+      if (res.ok) {
+        fetchGlobalDashboard(authToken);
+        showToast('Tag removed');
+      }
+    } catch (err) {
+      console.error(err);
+    }
   };
 
   // SSE Stream logic
@@ -505,10 +613,28 @@ function App() {
             )}
             <span>ContextDrop</span>
           </div>
-          <div>
+          <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
             <a href="#" onClick={(e) => { e.preventDefault(); startNewUpload(); }} className="nav-link">
               {view === 'chat' ? 'New Capsule' : 'Upload Zone'}
             </a>
+            
+            {authToken ? (
+              <button 
+                className="nav-link" 
+                onClick={() => { setAuthToken(''); localStorage.removeItem('cd_token'); setGlobalCapsules([]); setView('upload'); }}
+                style={{ border: 'none', background: 'transparent', cursor: 'pointer' }}
+              >
+                Log Out
+              </button>
+            ) : (
+              <button 
+                className="nav-link" 
+                onClick={() => { setAuthMode('login'); setAuthModalOpen(true); }}
+                style={{ border: 'none', background: 'transparent', cursor: 'pointer' }}
+              >
+                Log In
+              </button>
+            )}
           </div>
         </header>
       )}
@@ -536,6 +662,21 @@ function App() {
                 onClick={() => setActiveTab('link')}
               >
                 Paste Web Link
+              </button>
+              <button 
+                className={`tab-btn ${activeTab === 'dashboard' ? 'active' : ''}`}
+                onClick={() => {
+                  if (!authToken) {
+                    setAuthMode('login');
+                    setAuthModalOpen(true);
+                  } else {
+                    setActiveTab('dashboard');
+                    setView('global_dashboard');
+                    fetchGlobalDashboard(authToken);
+                  }
+                }}
+              >
+                My Dashboard
               </button>
             </div>
             
@@ -575,6 +716,17 @@ function App() {
             )}
 
             <div className="password-field-row" style={{ maxWidth: '320px', margin: '1.5rem auto 0' }}>
+              <label htmlFor="create-title">Capsule Title (Optional):</label>
+              <input 
+                id="create-title"
+                type="text" 
+                placeholder="Give it a name..." 
+                value={capsuleTitle}
+                onChange={(e) => setCapsuleTitle(e.target.value)}
+              />
+            </div>
+
+            <div className="password-field-row" style={{ maxWidth: '320px', margin: '1.25rem auto 0' }}>
               <label htmlFor="create-pass">Password Lock (Optional):</label>
               <input 
                 id="create-pass"
@@ -675,7 +827,7 @@ function App() {
             </div>
 
             <div className="ready-actions">
-              <button className="btn-secondary" onClick={openDashboard}>View Dashboard</button>
+              <button className="btn-secondary" onClick={() => openDashboard(capsuleSlug)}>View Dashboard</button>
               <button className="btn-primary" onClick={verifyAndOpenReader}>Open Reader View</button>
             </div>
           </div>
@@ -722,7 +874,7 @@ function App() {
         {/* State 6: Reader Chat View */}
         {view === 'chat' && (
           <>
-            {!isEmbedMode && (
+            {!isEmbedMode && !!getCapsuleOwnership(capsuleSlug) && (
               <button className="back-nav" onClick={() => setView('ready')}>
                 ← Back to Capsule Link
               </button>
@@ -811,8 +963,8 @@ function App() {
         {/* State 7: Creator Dashboard View */}
         {view === 'dashboard' && analytics && (
           <div className="dropzone-container" style={{ maxWidth: '800px', gap: '2.5rem' }}>
-            <button className="back-nav" onClick={() => setView('ready')}>
-              ← Back to Capsule Link
+            <button className="back-nav" onClick={() => setView(authToken ? 'global_dashboard' : 'ready')}>
+              ← Back
             </button>
             
             <div style={{ textAlign: 'left' }}>
@@ -917,7 +1069,121 @@ function App() {
             </div>
           </div>
         )}
+
+        {/* State 8: Global Dashboard */}
+        {view === 'global_dashboard' && (
+          <div className="global-dashboard-container fade-slide-up" style={{ width: '100%', maxWidth: '1000px' }}>
+            <h2 style={{ fontSize: '2rem', fontWeight: 800, marginBottom: '2rem' }}>My Capsules</h2>
+            {globalCapsules.length === 0 ? (
+              <div style={{ textAlign: 'center', padding: '4rem', color: 'var(--text-muted-light)' }}>
+                You haven't created any capsules yet.
+              </div>
+            ) : (
+              <div className="dashboard-grid">
+                {globalCapsules.map(cap => (
+                  <div key={cap.slug} className="metric-card" style={{ textAlign: 'left', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span style={{ fontSize: '1.2rem', fontWeight: 700, color: 'var(--text-light)' }}>{cap.title || cap.slug}</span>
+                      <span style={{ fontSize: '0.75rem', textTransform: 'uppercase', color: 'var(--accent-color)' }}>{cap.domain}</span>
+                    </div>
+                    <div style={{ fontSize: '0.8rem', color: 'var(--text-muted-light)' }}>
+                      Expires: {formatDate(cap.expires_at)}
+                    </div>
+                    <div style={{ display: 'flex', gap: '1rem', marginTop: '0.5rem' }}>
+                      <div style={{ fontSize: '0.85rem' }}>Queries: <strong style={{ color: 'var(--text-light)' }}>{cap.queries}</strong></div>
+                      <div style={{ fontSize: '0.85rem' }}>Unanswered: <strong style={{ color: '#FCA5A5' }}>{cap.unanswered}</strong></div>
+                    </div>
+                    
+                    {/* Tags */}
+                    <div style={{ marginTop: '1rem', display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
+                      {cap.tags.map((tag: string) => (
+                        <span key={tag} style={{ background: 'rgba(0, 229, 192, 0.1)', color: 'var(--accent-color)', padding: '0.2rem 0.6rem', borderRadius: '4px', fontSize: '0.7rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                          #{tag}
+                          <button 
+                            onClick={() => removeTagFromCapsule(cap.slug, tag)}
+                            style={{ background: 'none', border: 'none', color: 'var(--accent-color)', cursor: 'pointer', padding: 0, fontSize: '0.8rem', lineHeight: 1 }}
+                            title="Remove tag"
+                          >
+                            &times;
+                          </button>
+                        </span>
+                      ))}
+                      <input 
+                        type="text" 
+                        placeholder="+ Tag" 
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            addTagToCapsule(cap.slug, e.currentTarget.value);
+                            e.currentTarget.value = '';
+                          }
+                        }}
+                        style={{ background: 'transparent', border: '1px dashed var(--border-dark)', color: 'var(--text-light)', padding: '0.2rem 0.5rem', borderRadius: '4px', fontSize: '0.7rem', width: '60px', outline: 'none' }}
+                      />
+                    </div>
+                    
+                    <button 
+                      className="btn-secondary" 
+                      style={{ marginTop: '1.5rem', padding: '0.5rem', color: 'var(--text-light)' }}
+                      onClick={() => {
+                        setCapsuleSlug(cap.slug);
+                        openDashboard(cap.slug);
+                      }}
+                    >
+                      View Deep Analytics
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </main>
+
+      {/* Auth Modal */}
+      {authModalOpen && (
+        <div className="auth-modal-overlay fade-slide-up" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(9,13,22,0.8)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999, backdropFilter: 'blur(5px)' }}>
+          <div className="auth-modal" style={{ background: 'var(--primary-bg-alt)', padding: '2.5rem', borderRadius: '16px', border: '1px solid var(--border-dark)', width: '100%', maxWidth: '400px', boxShadow: 'var(--shadow-lg)' }}>
+            <h2 style={{ fontSize: '1.5rem', fontWeight: 800, marginBottom: '0.5rem' }}>
+              {authMode === 'login' ? 'Welcome Back' : 'Create Account'}
+            </h2>
+            <p style={{ color: 'var(--text-muted-light)', fontSize: '0.85rem', marginBottom: '2rem' }}>
+              {authMode === 'login' ? 'Log in to manage your capsules.' : 'Sign up to build your global dashboard.'}
+            </p>
+            <form onSubmit={handleAuthSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+              <input 
+                type="text" 
+                placeholder="Username" 
+                className="url-input-field"
+                value={authForm.username}
+                onChange={e => setAuthForm({...authForm, username: e.target.value})}
+                required
+              />
+              <input 
+                type="password" 
+                placeholder="Password" 
+                className="url-input-field"
+                value={authForm.password}
+                onChange={e => setAuthForm({...authForm, password: e.target.value})}
+                required
+              />
+              <button type="submit" className="btn-primary" style={{ marginTop: '1rem' }}>
+                {authMode === 'login' ? 'Log In' : 'Sign Up'}
+              </button>
+            </form>
+            <div style={{ marginTop: '1.5rem', textAlign: 'center', fontSize: '0.85rem' }}>
+              <a href="#" onClick={(e) => { e.preventDefault(); setAuthMode(authMode === 'login' ? 'register' : 'login'); }}>
+                {authMode === 'login' ? "Don't have an account? Sign up" : "Already have an account? Log in"}
+              </a>
+            </div>
+            <button 
+              onClick={() => setAuthModalOpen(false)}
+              style={{ background: 'none', border: 'none', color: 'var(--text-muted-light)', marginTop: '2rem', width: '100%', cursor: 'pointer' }}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Toast Notification */}
       {toastMessage && <div className="toast">{toastMessage}</div>}

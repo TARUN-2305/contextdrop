@@ -52,6 +52,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     # Third-party apps
     'rest_framework',
+    'rest_framework.authtoken',
     'corsheaders',
     # Local apps
     'capsules',
@@ -143,6 +144,12 @@ CORS_ALLOW_ALL_ORIGINS = env('CORS_ALLOW_ALL_ORIGINS', default=True)
 if not CORS_ALLOW_ALL_ORIGINS:
     _cors_origins = env('CORS_ALLOWED_ORIGINS', default='')
     CORS_ALLOWED_ORIGINS = [o.strip() for o in _cors_origins.split(',') if o.strip()]
+
+from corsheaders.defaults import default_headers
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    'X-Capsule-ID',
+    'Authorization',
+]
 
 # LLM & Embedding Settings
 EMBEDDING_PROVIDER = env('EMBEDDING_PROVIDER', default='ollama')

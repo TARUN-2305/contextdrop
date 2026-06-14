@@ -11,6 +11,10 @@ from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.authtoken.models import Token
+from django.contrib.auth import authenticate, login, logout
+from django.contrib.auth.models import User
 from pypdf import PdfReader
 
 from .models import Capsule, DocumentChunk, CapsuleAnalytic
@@ -82,6 +86,7 @@ def ingest_document(request):
     password_hash = make_password(password) if password else ''
     logo_url = request.data.get('logo_url', '').strip()
     accent_color = request.data.get('accent_color', '').strip()
+    title = request.data.get('title', '').strip() or file_name
 
     # Generate suggested starter questions based on the first chunk
     suggested_list = generate_suggested_questions(first_chunk_text)
@@ -89,6 +94,7 @@ def ingest_document(request):
 
     capsule = Capsule.objects.create(
         slug=slug,
+        title=title,
         expires_at=expires_at,
         domain=detected_domain,
         password_hash=password_hash,
@@ -96,6 +102,16 @@ def ingest_document(request):
         custom_logo_url=logo_url,
         custom_accent_color=accent_color
     )
+
+    auth_header = request.headers.get('Authorization')
+    if auth_header and auth_header.startswith('Token '):
+        token_key = auth_header.split('Token ')[1]
+        try:
+            token = Token.objects.get(key=token_key)
+            capsule.creator = token.user
+            capsule.save()
+        except Token.DoesNotExist:
+            pass
 
     # Save document chunks with embeddings using raw SQL to cast vector types explicitly
     try:
@@ -268,9 +284,25 @@ def log_analytic(request, slug):
 def get_analytics(request, slug):
     capsule = get_object_or_404(Capsule, slug=slug)
 
-    # Ownership check via Capsule ID (UUID)
+    # Ownership check via Capsule ID (UUID) or Auth Token
     provided_id = request.headers.get('X-Capsule-ID') or request.data.get('capsule_id') or request.query_params.get('capsule_id')
-    if not provided_id or str(provided_id) != str(capsule.id):
+    is_owner = False
+    
+    if provided_id and str(provided_id) == str(capsule.id):
+        is_owner = True
+        
+    auth_header = request.headers.get('Authorization')
+    if auth_header and auth_header.startswith('Token '):
+        token_key = auth_header.split('Token ')[1]
+        try:
+            from rest_framework.authtoken.models import Token
+            token = Token.objects.get(key=token_key)
+            if capsule.creator == token.user:
+                is_owner = True
+        except Exception:
+            pass
+
+    if not is_owner:
         return Response({'error': 'Access denied: Creator authentication token (Capsule ID) is missing or invalid.'}, status=status.HTTP_403_FORBIDDEN)
 
     # Gather metrics
@@ -297,3 +329,102 @@ def get_analytics(request, slug):
         'unanswered_list': unanswered_list,
         'heatmap': heatmap
     }, status=status.HTTP_200_OK)
+
+# ==========================================
+# AUTHENTICATION AND GLOBAL DASHBOARD APIs
+# ==========================================
+
+@api_view(['POST'])
+def register_user(request):
+    username = request.data.get('username')
+    password = request.data.get('password')
+    email = request.data.get('email', '')
+    if not username or not password:
+        return Response({'error': 'Username and password required'}, status=status.HTTP_400_BAD_REQUEST)
+    if User.objects.filter(username=username).exists():
+        return Response({'error': 'Username already exists'}, status=status.HTTP_400_BAD_REQUEST)
+    
+    user = User.objects.create_user(username=username, email=email, password=password)
+    token, _ = Token.objects.get_or_create(user=user)
+    return Response({'token': token.key, 'username': user.username}, status=status.HTTP_201_CREATED)
+
+@api_view(['POST'])
+def login_user(request):
+    username = request.data.get('username')
+    password = request.data.get('password')
+    user = authenticate(username=username, password=password)
+    if not user:
+        return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
+    token, _ = Token.objects.get_or_create(user=user)
+    return Response({'token': token.key, 'username': user.username}, status=status.HTTP_200_OK)
+
+@api_view(['POST'])
+def logout_user(request):
+    if request.user.is_authenticated:
+        request.user.auth_token.delete()
+    return Response({'message': 'Logged out successfully'}, status=status.HTTP_200_OK)
+
+@api_view(['GET'])
+def list_user_capsules(request):
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Token '):
+        return Response({'error': 'Unauthorized'}, status=status.HTTP_401_UNAUTHORIZED)
+    
+    token_key = auth_header.split('Token ')[1]
+    try:
+        token = Token.objects.get(key=token_key)
+        user = token.user
+    except Token.DoesNotExist:
+        return Response({'error': 'Invalid token'}, status=status.HTTP_401_UNAUTHORIZED)
+        
+    capsules = Capsule.objects.filter(creator=user).order_by('-created_at')
+    
+    data = []
+    for cap in capsules:
+        queries = cap.analytics.count()
+        unanswered = cap.analytics.filter(was_answered=False).count()
+        tags = [t.name for t in cap.tags.all()]
+        data.append({
+            'slug': cap.slug,
+            'title': cap.title,
+            'domain': cap.domain,
+            'created_at': cap.created_at,
+            'expires_at': cap.expires_at,
+            'queries': queries,
+            'unanswered': unanswered,
+            'tags': tags,
+        })
+    return Response({'capsules': data}, status=status.HTTP_200_OK)
+
+@api_view(['POST', 'DELETE'])
+def update_capsule_tags(request, slug):
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Token '):
+        return Response({'error': 'Unauthorized'}, status=status.HTTP_401_UNAUTHORIZED)
+    token_key = auth_header.split('Token ')[1]
+    try:
+        user = Token.objects.get(key=token_key).user
+        capsule = Capsule.objects.get(slug=slug, creator=user)
+    except (Token.DoesNotExist, Capsule.DoesNotExist):
+        return Response({'error': 'Not found or unauthorized'}, status=status.HTTP_404_NOT_FOUND)
+
+    if request.method == 'POST':
+        new_tag_name = request.data.get('tag', '').strip()
+        if new_tag_name:
+            from .models import Tag
+            tag, _ = Tag.objects.get_or_create(name=new_tag_name, user=user)
+            capsule.tags.add(tag)
+            return Response({'status': 'tag added'})
+        return Response({'error': 'no tag provided'}, status=400)
+        
+    elif request.method == 'DELETE':
+        tag_to_remove = request.data.get('tag', '').strip()
+        if tag_to_remove:
+            from .models import Tag
+            try:
+                tag = Tag.objects.get(name=tag_to_remove, user=user)
+                capsule.tags.remove(tag)
+                return Response({'status': 'tag removed'})
+            except Tag.DoesNotExist:
+                return Response({'error': 'tag not found'}, status=404)
+        return Response({'error': 'no tag provided'}, status=400)
