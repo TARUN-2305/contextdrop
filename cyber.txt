@@ -1,0 +1,26 @@
+Cybersecurity Skills & Best Practices
+
+Based on the security vulnerabilities discussed in the video, here are the essential engineering skills and design principles to prevent similar breaches in any web application:
+
+1. Enforce Trust Boundaries
+Never trust the client: Assume all front-end code is accessible and manipulatable by the user. 
+Server-side validation: Authentication and security decisions (like OTP verification) must only occur on the server. Never rely on the front-end to report successful login status.
+
+2. Manage Secrets Securely
+No hard-coded secrets: Never embed API keys, passwords, or sensitive credentials in client-side JavaScript. Minification is not encryption.
+Use secure storage: Store sensitive data on the server using environment variables or dedicated secret management services. Only issue short-lived, scoped tokens to the client.
+
+3. Implement Robust Authorization
+IDOR Prevention: Insecure Direct Object Reference (IDOR) occurs when an application fails to check if the authenticated user owns the record they are requesting. 
+Explicit Ownership Checks: Every data access point must verify that the requesting user has the authority to view or modify the specific object requested.
+
+4. Secure Cloud Storage
+Private by Default: Cloud storage buckets (like AWS S3) should be private. Disable public access at the bucket level.
+Least Privilege Access: Avoid giving the application broad read/write access. Use temporary, signed URLs to grant access to individual files for limited durations.
+
+5. Resilience Against Attacks
+Defense in Depth: Even if you are under a Denial of Service (DoS) attack, your system should have internal security controls (like rate limiting, monitoring, and firewalls) to prevent data exposure via vulnerabilities.
+
+**
+
+"The one thing to take away from this is this: on every request, is your server verifying not only who the user is, but whether they are allowed to access that specific resource?"

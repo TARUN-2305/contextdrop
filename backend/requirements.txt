@@ -1,0 +1,10 @@
+django>=5.0,<6.0
+djangorestframework
+django-cors-headers
+psycopg[binary]
+django-environ
+pypdf
+requests
+beautifulsoup4
+gunicorn>=21.0,<23.0
+

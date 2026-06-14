@@ -1,0 +1,44 @@
+services:
+  # Django REST API
+  - type: web
+    name: contextdrop-api
+    runtime: python
+    rootDir: backend
+    buildCommand: "pip install -r requirements.txt && python manage.py migrate"
+    startCommand: "gunicorn contextdrop.wsgi:application --bind 0.0.0.0:$PORT --workers 2 --timeout 120"
+    envVars:
+      - key: DEBUG
+        value: "False"
+      - key: EMBEDDING_PROVIDER
+        value: groq
+      - key: DATABASE_URL
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: GROQ_API_KEY
+        sync: false
+      - key: INTERNAL_API_KEY
+        sync: false
+      - key: ALLOWED_HOSTS
+        sync: false
+      - key: CORS_ALLOW_ALL_ORIGINS
+        value: "False"
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+
+  # Node.js SSE Chat Server
+  - type: web
+    name: contextdrop-sse
+    runtime: node
+    rootDir: sse-server
+    buildCommand: "npm install"
+    startCommand: "node index.js"
+    envVars:
+      - key: DJANGO_API_URL
+        sync: false
+      - key: INTERNAL_API_KEY
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: PORT
+        value: "4000"
