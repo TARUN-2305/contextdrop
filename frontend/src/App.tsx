@@ -12,8 +12,8 @@ interface Message {
   isStreaming?: boolean;
 }
 
-type ViewState = 'upload' | 'processing' | 'ready' | 'chat' | 'password_gate' | 'expired' | 'dashboard';
-type UploadTab = 'file' | 'link';
+type ViewState = 'upload' | 'processing' | 'ready' | 'chat' | 'password_gate' | 'expired' | 'dashboard' | 'global_dashboard';
+type UploadTab = 'file' | 'link' | 'dashboard';
 
 interface DashboardAnalytics {
   total_queries: number;
@@ -96,9 +96,87 @@ function App() {
   const [inputText, setInputText] = useState<string>('');
   const [isStreaming, setIsStreaming] = useState<boolean>(false);
   const [toastMessage, setToastMessage] = useState<string>('');
+  const [processingStatus, setProcessingStatus] = useState('Uploading document and extracting text...');
+  const [processingPercent, setProcessingPercent] = useState<number>(10);
+  const [documentUrl, setDocumentUrl] = useState<string>('');
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const isPdf = !!(documentUrl && documentUrl.toLowerCase().split('?')[0].endsWith('.pdf'));
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Connection helper for ingestion SSE progress streams
+  const startIngestionProgressStream = (slug: string) => {
+    const eventSource = new EventSource(`${SSE_URL}/stream/ingest/${slug}`);
+    
+    eventSource.onmessage = (event) => {
+      if (event.data === '[DONE]') {
+        eventSource.close();
+      } else {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.step) {
+            setProcessingStatus(data.step);
+          }
+          if (data.percent) {
+            setProcessingPercent(data.percent);
+          }
+        } catch (err) {
+          // ignore
+        }
+      }
+    };
+
+    eventSource.onerror = () => {
+      eventSource.close();
+    };
+
+    return eventSource;
+  };
+
+  // Render message text with dynamic inline citation chips
+  const renderMessageText = (text: string) => {
+    const citationRegex = /(\[Page \d+(?:,\s*[^\]]+)?\])/g;
+    const parts = text.split(citationRegex);
+    return parts.map((part, index) => {
+      if (citationRegex.test(part)) {
+        const cleanLabel = part.slice(1, -1); // remove [ and ]
+        return (
+          <span 
+            key={index} 
+            className="citation-chip" 
+            onClick={() => {
+              showToast(`Citing: ${cleanLabel}`);
+              const match = cleanLabel.match(/Page\s+(\d+)/i);
+              if (match && match[1]) {
+                const pageNum = match[1];
+                const iframe = document.getElementById('pdf-iframe-viewer') as HTMLIFrameElement;
+                if (iframe) {
+                  iframe.src = `${documentUrl}#page=${pageNum}&zoom=100`;
+                }
+              }
+            }}
+            style={{
+              fontFamily: 'var(--mono-font)',
+              fontSize: '0.8rem',
+              background: 'rgba(0, 229, 192, 0.15)',
+              color: 'var(--accent-color)',
+              padding: '2px 6px',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              margin: '0 4px',
+              display: 'inline-block',
+              border: '1px solid rgba(0, 229, 192, 0.3)',
+              fontWeight: 'bold'
+            }}
+          >
+            {cleanLabel}
+          </span>
+        );
+      }
+      return part;
+    });
+  };
 
   // Auto-scroll chat history
   useEffect(() => {
@@ -139,7 +217,7 @@ function App() {
       const rec = new SpeechRecognition();
       rec.continuous = false;
       rec.interimResults = false;
-      rec.lang = 'en-US';
+      rec.lang = navigator.language || 'en-US';
 
       rec.onstart = () => {
         setIsListening(true);
@@ -205,6 +283,12 @@ function App() {
 
   // Perform Ingestion POST
   const processSelectedFile = (selectedFile: File) => {
+    if (selectedFile.size > 50 * 1024 * 1024) {
+      showToast('Error: File size exceeds the 50MB limit.');
+      return;
+    }
+    const customSlug = Math.random().toString(36).substring(2, 10);
+    setCapsuleSlug(customSlug);
     setFile(selectedFile);
     setFileName(selectedFile.name);
     setView('processing');
@@ -212,6 +296,7 @@ function App() {
     const formData = new FormData();
     formData.append('file', selectedFile);
     formData.append('ttl_days', ttlDays.toString());
+    formData.append('slug', customSlug);
     if (capsuleTitle.trim()) {
       formData.append('title', capsuleTitle.trim());
     }
@@ -225,19 +310,22 @@ function App() {
       formData.append('accent_color', accentColor.trim());
     }
 
-    sendIngestRequest(formData, selectedFile.name);
+    sendIngestRequest(formData, customSlug);
   };
 
   const processUrlLink = (e: React.FormEvent) => {
     e.preventDefault();
     if (!webUrl.trim()) return;
 
+    const customSlug = Math.random().toString(36).substring(2, 10);
+    setCapsuleSlug(customSlug);
     setFileName(webUrl);
     setView('processing');
 
     const formData = new FormData();
     formData.append('url', webUrl.trim());
     formData.append('ttl_days', ttlDays.toString());
+    formData.append('slug', customSlug);
     if (capsuleTitle.trim()) {
       formData.append('title', capsuleTitle.trim());
     }
@@ -251,14 +339,19 @@ function App() {
       formData.append('accent_color', accentColor.trim());
     }
 
-    sendIngestRequest(formData, webUrl);
+    sendIngestRequest(formData, customSlug);
   };
 
-  const sendIngestRequest = (formData: FormData, _displayTitle: string) => {
+  const sendIngestRequest = (formData: FormData, customSlug: string) => {
     const headers: Record<string, string> = {};
     if (authToken) {
       headers['Authorization'] = `Token ${authToken}`;
     }
+
+    setProcessingPercent(10);
+    setProcessingStatus("Initiating connection...");
+
+    const progressStream = startIngestionProgressStream(customSlug);
 
     fetch(`${API_URL}/api/ingest`, {
       method: 'POST',
@@ -270,23 +363,27 @@ function App() {
       return res.json();
     })
     .then(data => {
-      setCapsuleSlug(data.slug);
-      setCapsuleId(data.id);
-      saveCapsuleOwnership(data.slug, data.id);
-      setExpiresAt(data.expires_at);
-      setDomain(data.domain);
-      setView('ready');
-      // Set the password we just set as reader password so the creator gets instant access without retyping
-      setReaderPassword(password.trim());
+      progressStream.close();
+      setProcessingPercent(100);
+      setProcessingStatus("Ingestion complete!");
+      setTimeout(() => {
+        setCapsuleSlug(data.slug);
+        setCapsuleId(data.id);
+        saveCapsuleOwnership(data.slug, data.id);
+        setExpiresAt(data.expires_at);
+        setDomain(data.domain);
+        setView('ready');
+        setReaderPassword(password.trim());
+      }, 500);
     })
     .catch(err => {
+      progressStream.close();
       console.error(err);
       // Fallback local mockup
-      const mockSlug = Math.random().toString(36).substring(2, 10);
       const mockExpiry = new Date();
       mockExpiry.setDate(mockExpiry.getDate() + ttlDays);
       
-      setCapsuleSlug(mockSlug);
+      setCapsuleSlug(customSlug);
       setCapsuleId('mock-uuid-1234');
       setExpiresAt(mockExpiry.toISOString());
       setDomain('business');
@@ -331,6 +428,11 @@ function App() {
 
         // Access allowed
         setSuggestedQuestions(data.suggested_questions || []);
+        if (data.document_url) {
+          setDocumentUrl(data.document_url);
+        } else {
+          setDocumentUrl('');
+        }
         setView('chat');
         setPasswordError('');
       })
@@ -415,6 +517,7 @@ function App() {
 
   const startNewUpload = () => {
     setView('upload');
+    setActiveTab('file');
     setCapsuleSlug('');
     setCapsuleId('');
     setCapsuleTitle('');
@@ -425,6 +528,8 @@ function App() {
     setMessages([]);
     setSuggestedQuestions([]);
     setAnalytics(null);
+    setDocumentUrl('');
+    setSearchQuery('');
     // Reset accent colors to defaults
     document.documentElement.style.setProperty('--accent-color', '#00E5C0');
     document.documentElement.style.setProperty('--accent-hover', '#00CCAB');
@@ -640,7 +745,7 @@ function App() {
       )}
 
       {/* Main Content Area */}
-      <main className={view === 'chat' ? 'reader-layout' : 'main-layout'}>
+      <main className={view === 'chat' ? (isPdf ? 'reader-layout pdf-mode' : 'reader-layout') : 'main-layout'}>
         {/* State 1: Upload View */}
         {view === 'upload' && (
           <div className="dropzone-container">
@@ -793,9 +898,9 @@ function App() {
             <h2 style={{ color: 'var(--text-light)', marginBottom: '0.5rem', fontWeight: 800 }}>Reading Document</h2>
             <p className="file-info">{fileName}</p>
             <div className="progress-bar-container">
-              <div className="progress-bar" />
+              <div className="progress-bar" style={{ width: `${processingPercent}%`, transition: 'width 0.4s ease' }} />
             </div>
-            <p className="status-text">Generating suggested questions... classifying domain...</p>
+            <p className="status-text">{processingStatus}</p>
           </div>
         )}
 
@@ -872,93 +977,107 @@ function App() {
         )}
 
         {/* State 6: Reader Chat View */}
-        {view === 'chat' && (
-          <>
-            {!isEmbedMode && !!getCapsuleOwnership(capsuleSlug) && (
-              <button className="back-nav" onClick={() => setView('ready')}>
-                ← Back to Capsule Link
-              </button>
-            )}
-            <div className="reader-header">
-              <div>
-                <h2 className="doc-title">{fileName || 'Document Capsule'}</h2>
-                <div className="doc-meta">
-                  <span>Domain: {domain.toUpperCase()}</span> · <span>Shared anonymously</span>
-                </div>
-              </div>
-              {!isEmbedMode && (
-                <button className="view-doc-btn" onClick={() => showToast('Full document viewer coming in V3!')}>
-                  View Original
-                </button>
-              )}
-            </div>
-
-            <div className="chat-history">
-              {messages.map((msg, index) => {
-                const isWarning = msg.sender === 'assistant' && msg.text.includes("This document doesn't cover that.");
-                return (
-                  <div key={index} className={`chat-message ${msg.sender}`}>
-                    <span className="message-sender">
-                      {msg.sender === 'user' ? 'You' : 'Assistant'}
-                    </span>
-                    <div className={`message-bubble ${isWarning ? 'amber-warning-bubble' : ''}`}>
-                      {msg.text}
-                      {msg.sender === 'assistant' && !msg.isStreaming && index > 0 && !isWarning && (
-                        <div>
-                          <span className="citation-tag" onClick={() => showToast('Interactive citations coming in V3!')}>
-                            [Page 1, Excerpt]
-                          </span>
-                        </div>
-                      )}
+        {view === 'chat' && (() => {
+          return (
+            <div className={`chat-layout-wrapper ${isPdf ? 'split-pane-active' : ''}`} style={isPdf ? { display: 'flex', width: '100%', height: 'calc(100vh - 100px)', gap: '2rem', padding: '0 2rem 1.5rem', boxSizing: 'border-box', overflow: 'hidden' } : undefined}>
+              <div className="chat-left-pane" style={isPdf ? { flex: '0 0 40%', display: 'flex', flexDirection: 'column', height: '100%', minWidth: '380px', borderRight: '1px solid var(--border-dark)', paddingRight: '2rem' } : { width: '100%', maxWidth: '800px', margin: '0 auto', display: 'flex', flexDirection: 'column' }}>
+                {!isEmbedMode && !!getCapsuleOwnership(capsuleSlug) && (
+                  <button className="back-nav" onClick={() => setView('ready')}>
+                    ← Back to Capsule Link
+                  </button>
+                )}
+                <div className="reader-header">
+                  <div>
+                    <h2 className="doc-title">{fileName || 'Document Capsule'}</h2>
+                    <div className="doc-meta">
+                      <span>Domain: {domain.toUpperCase()}</span> · <span>Shared anonymously</span>
                     </div>
                   </div>
-                );
-              })}
-              
-              {messages.length === 1 && suggestedQuestions.length > 0 && (
-                <div className="suggested-box">
-                  <span className="suggested-title">Suggested questions</span>
-                  {suggestedQuestions.map((q, idx) => (
-                    <button 
-                      key={idx} 
-                      className="suggested-btn" 
-                      onClick={() => handleSendMessage(undefined, q)}
+                  {!isEmbedMode && documentUrl && (
+                    <a 
+                      href={documentUrl} 
+                      target="_blank" 
+                      rel="noopener noreferrer" 
+                      className="view-doc-btn"
+                      style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', textDecoration: 'none' }}
                     >
-                      • {q}
+                      Open Full
+                    </a>
+                  )}
+                </div>
+
+                <div className="chat-history">
+                  {messages.map((msg, index) => {
+                    const isWarning = msg.sender === 'assistant' && msg.text.includes("This document doesn't cover that.");
+                    return (
+                      <div key={index} className={`chat-message ${msg.sender}`}>
+                        <span className="message-sender">
+                          {msg.sender === 'user' ? 'You' : 'Assistant'}
+                        </span>
+                        <div className={`message-bubble ${isWarning ? 'amber-warning-bubble' : ''}`}>
+                          {renderMessageText(msg.text)}
+                        </div>
+                      </div>
+                    );
+                  })}
+                  
+                  {messages.length === 1 && suggestedQuestions.length > 0 && (
+                    <div className="suggested-box">
+                      <span className="suggested-title">Suggested questions</span>
+                      {suggestedQuestions.map((q, idx) => (
+                        <button 
+                          key={idx} 
+                          className="suggested-btn" 
+                          onClick={() => handleSendMessage(undefined, q)}
+                        >
+                          • {q}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  
+                  <div ref={chatEndRef} />
+                </div>
+
+                <form onSubmit={handleSendMessage} className="chat-input-form" style={isPdf ? { marginTop: 'auto' } : undefined}>
+                  <input 
+                    type="text" 
+                    className="chat-input"
+                    placeholder="Ask a question about this document..."
+                    value={inputText}
+                    onChange={(e) => setInputText(e.target.value)}
+                    disabled={isStreaming}
+                  />
+                  {speechSupported && (
+                    <button 
+                      type="button" 
+                      className={`mic-btn ${isListening ? 'active' : ''}`}
+                      onClick={toggleListening}
+                      title="Voice input"
+                      disabled={isStreaming}
+                    >
+                      🎤
                     </button>
-                  ))}
+                  )}
+                  <button type="submit" className="send-btn" disabled={!inputText.trim() || isStreaming}>
+                    →
+                  </button>
+                </form>
+              </div>
+
+              {isPdf && (
+                <div className="chat-right-pane" style={{ flex: '1 1 60%', height: '100%', borderRadius: '16px', overflow: 'hidden', border: '1px solid var(--border-dark)', background: 'var(--primary-bg-alt)', boxShadow: 'var(--shadow-md)' }}>
+                  <iframe 
+                    id="pdf-iframe-viewer"
+                    src={`${documentUrl}#zoom=100`} 
+                    style={{ width: '100%', height: '100%', border: 'none' }}
+                    title="PDF Viewer"
+                  />
                 </div>
               )}
-              
-              <div ref={chatEndRef} />
             </div>
-
-            <form onSubmit={handleSendMessage} className="chat-input-form">
-              <input 
-                type="text" 
-                className="chat-input"
-                placeholder="Ask a question about this document..."
-                value={inputText}
-                onChange={(e) => setInputText(e.target.value)}
-                disabled={isStreaming}
-              />
-              {speechSupported && (
-                <button 
-                  type="button" 
-                  className={`mic-btn ${isListening ? 'active' : ''}`}
-                  onClick={toggleListening}
-                  title="Voice input"
-                  disabled={isStreaming}
-                >
-                  🎤
-                </button>
-              )}
-              <button type="submit" className="send-btn" disabled={!inputText.trim() || isStreaming}>
-                →
-              </button>
-            </form>
-          </>
-        )}
+          );
+        })()}
 
         {/* State 7: Creator Dashboard View */}
         {view === 'dashboard' && analytics && (
@@ -1071,19 +1190,56 @@ function App() {
         )}
 
         {/* State 8: Global Dashboard */}
-        {view === 'global_dashboard' && (
-          <div className="global-dashboard-container fade-slide-up" style={{ width: '100%', maxWidth: '1000px' }}>
-            <h2 style={{ fontSize: '2rem', fontWeight: 800, marginBottom: '2rem' }}>My Capsules</h2>
-            {globalCapsules.length === 0 ? (
-              <div style={{ textAlign: 'center', padding: '4rem', color: 'var(--text-muted-light)' }}>
-                You haven't created any capsules yet.
+        {view === 'global_dashboard' && (() => {
+          const filteredCapsules = globalCapsules.filter(cap => {
+            const query = searchQuery.toLowerCase().trim();
+            if (!query) return true;
+            const titleMatch = (cap.title || '').toLowerCase().includes(query);
+            const slugMatch = (cap.slug || '').toLowerCase().includes(query);
+            const domainMatch = (cap.domain || '').toLowerCase().includes(query);
+            const tagMatch = cap.tags && cap.tags.some((t: string) => t.toLowerCase().includes(query));
+            return titleMatch || slugMatch || domainMatch || tagMatch;
+          });
+
+          return (
+            <div className="global-dashboard-container fade-slide-up" style={{ width: '100%', maxWidth: '1000px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '2rem', flexWrap: 'wrap', gap: '1rem' }}>
+                <h2 style={{ fontSize: '2rem', fontWeight: 800, margin: 0 }}>My Capsules</h2>
+                <input 
+                  type="text" 
+                  placeholder="Search capsules..." 
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  style={{
+                    background: 'var(--primary-bg-alt)',
+                    border: '1px solid var(--border-dark)',
+                    color: 'var(--text-light)',
+                    padding: '0.6rem 1.2rem',
+                    borderRadius: '100px',
+                    fontSize: '0.9rem',
+                    width: '240px',
+                    outline: 'none'
+                  }}
+                />
               </div>
-            ) : (
-              <div className="dashboard-grid">
-                {globalCapsules.map(cap => (
+              {filteredCapsules.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: '4rem', color: 'var(--text-muted-light)' }}>
+                  {globalCapsules.length === 0 ? "You haven't created any capsules yet." : "No matching capsules found."}
+                </div>
+              ) : (
+                <div className="dashboard-grid">
+                  {filteredCapsules.map(cap => (
                   <div key={cap.slug} className="metric-card" style={{ textAlign: 'left', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <span style={{ fontSize: '1.2rem', fontWeight: 700, color: 'var(--text-light)' }}>{cap.title || cap.slug}</span>
+                      <a 
+                        href={`${APP_URL}/d/${cap.slug}`} 
+                        target="_blank" 
+                        rel="noopener noreferrer"
+                        style={{ fontSize: '1.25rem', fontWeight: 800, color: 'var(--text-light)', display: 'inline-flex', alignItems: 'center', gap: '0.35rem', textDecoration: 'none' }}
+                        title="Open Q&A Reader View"
+                      >
+                        {cap.title || cap.slug} <span style={{ fontSize: '0.8rem', color: 'var(--accent-color)' }}>↗</span>
+                      </a>
                       <span style={{ fontSize: '0.75rem', textTransform: 'uppercase', color: 'var(--accent-color)' }}>{cap.domain}</span>
                     </div>
                     <div style={{ fontSize: '0.8rem', color: 'var(--text-muted-light)' }}>
@@ -1121,22 +1277,38 @@ function App() {
                       />
                     </div>
                     
-                    <button 
-                      className="btn-secondary" 
-                      style={{ marginTop: '1.5rem', padding: '0.5rem', color: 'var(--text-light)' }}
-                      onClick={() => {
-                        setCapsuleSlug(cap.slug);
-                        openDashboard(cap.slug);
-                      }}
-                    >
-                      View Deep Analytics
-                    </button>
+                    {/* Action buttons at card bottom */}
+                    <div style={{ display: 'flex', gap: '0.75rem', marginTop: '1.5rem' }}>
+                      <button 
+                        className="btn-primary" 
+                        style={{ flex: 1, padding: '0.65rem', fontSize: '0.8rem', fontWeight: 700 }}
+                        onClick={() => {
+                          const url = `${APP_URL}/d/${cap.slug}`;
+                          navigator.clipboard.writeText(url)
+                            .then(() => showToast('Q&A Link Copied!'))
+                            .catch(() => showToast('Failed to copy.'));
+                        }}
+                      >
+                        Copy Link
+                      </button>
+                      <button 
+                        className="btn-secondary" 
+                        style={{ flex: 1, padding: '0.65rem', fontSize: '0.8rem', fontWeight: 700, color: 'var(--text-light)' }}
+                        onClick={() => {
+                          setCapsuleSlug(cap.slug);
+                          openDashboard(cap.slug);
+                        }}
+                      >
+                        Analytics
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>
             )}
           </div>
-        )}
+          );
+        })()}
       </main>
 
       {/* Auth Modal */}

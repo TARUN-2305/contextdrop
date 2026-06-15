@@ -1,6 +1,8 @@
 import uuid
 from django.db import models
 from django.contrib.auth.models import User
+from pgvector.django import VectorField
+
 
 class Tag(models.Model):
     name = models.CharField(max_length=50)
@@ -25,6 +27,7 @@ class Capsule(models.Model):
     suggested_questions = models.TextField(blank=True, default='')
     custom_logo_url = models.TextField(blank=True, default='')  # Creator custom logo image URL
     custom_accent_color = models.CharField(max_length=7, blank=True, default='')  # Creator custom HEX code
+    document_file = models.FileField(upload_to='capsules/', null=True, blank=True)
     tags = models.ManyToManyField(Tag, blank=True, related_name='capsules')
 
     def __str__(self):
@@ -36,7 +39,7 @@ class DocumentChunk(models.Model):
     page_number = models.IntegerField(null=True, blank=True)
     section_title = models.CharField(max_length=200, blank=True)
     chunk_index = models.IntegerField()
-    embedding = models.TextField()
+    embedding = VectorField(dimensions=768, null=True, blank=True)
 
     def __str__(self):
         return f"Chunk {self.chunk_index} for Capsule {self.capsule.slug}"

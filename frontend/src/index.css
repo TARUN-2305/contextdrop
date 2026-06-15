@@ -546,6 +546,11 @@ a:hover {
   overflow: hidden;
 }
 
+.reader-layout.pdf-mode {
+  max-width: 100%;
+  padding: 1rem 2rem;
+}
+
 .reader-header {
   display: flex;
   justify-content: space-between;
@@ -584,6 +589,7 @@ a:hover {
   font-weight: 600;
   cursor: pointer;
   transition: var(--transition);
+  white-space: nowrap;
 }
 
 .view-doc-btn:hover {
@@ -813,9 +819,21 @@ a:hover {
 /* Creator Dashboard visual layouts */
 .dashboard-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 1.5rem;
   width: 100%;
+}
+
+@media (max-width: 900px) {
+  .dashboard-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 600px) {
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .metric-card {
@@ -1190,5 +1208,21 @@ body.embed-mode .reader-layout {
   max-width: 100% !important;
   padding: 0.5rem !important;
   border-radius: 0 !important;
+}
+
+/* Custom Scrollbars for a premium dark theme */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.01);
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-color);
 }
 

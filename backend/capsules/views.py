@@ -1,6 +1,11 @@
 import secrets
 import json
 import hashlib
+import hmac
+import time
+import redis
+import docx
+import os
 from datetime import timedelta
 from django.utils import timezone
 from django.db import connection
@@ -20,11 +25,39 @@ from pypdf import PdfReader
 from .models import Capsule, DocumentChunk, CapsuleAnalytic
 from .utils import chunk_text_by_pages, get_embedding, classify_domain, scrape_url_text, generate_suggested_questions
 
-def is_internal_request(request):
+def is_internal_request(request, slug=None):
+    # 1. Bearer Token Check (supports comma-separated keys for rotation)
     auth_header = request.headers.get('Authorization') or request.META.get('HTTP_AUTHORIZATION')
     if auth_header and auth_header.startswith('Bearer '):
         token = auth_header.split('Bearer ')[1].strip()
-        return token == settings.INTERNAL_API_KEY
+        allowed_keys = [k.strip() for k in getattr(settings, 'INTERNAL_API_KEY', '').split(',') if k.strip()]
+        if token in allowed_keys:
+            return True
+
+    # 2. Cryptographic HMAC Signature Check
+    signature = request.headers.get('X-Signature') or request.META.get('HTTP_X_SIGNATURE')
+    timestamp_str = request.headers.get('X-Timestamp') or request.META.get('HTTP_X_TIMESTAMP')
+    
+    if signature and timestamp_str and slug:
+        try:
+            timestamp = int(timestamp_str)
+            # Verify timestamp is within 5 minutes (300,000 milliseconds)
+            now_ms = int(time.time() * 1000)
+            if abs(now_ms - timestamp) > 300000:
+                return False
+                
+            allowed_keys = [k.strip() for k in getattr(settings, 'INTERNAL_API_KEY', '').split(',') if k.strip()]
+            for key in allowed_keys:
+                expected_signature = hmac.new(
+                    key.encode('utf-8'),
+                    f"{timestamp_str}{slug}".encode('utf-8'),
+                    hashlib.sha256
+                ).hexdigest()
+                if hmac.compare_digest(expected_signature, signature):
+                    return True
+        except Exception:
+            pass
+
     return False
 
 
@@ -39,10 +72,31 @@ def ingest_document(request):
 
     ttl_days = request.data.get('ttl_days', 7)  # default to 7 days
     
-    # Generate unique slug
-    slug = secrets.token_urlsafe(6)[:8]
+    # Generate unique slug (or use pre-generated one from frontend)
+    slug = request.data.get('slug', '').strip()
+    if not slug:
+        slug = secrets.token_urlsafe(6)[:8]
     while Capsule.objects.filter(slug=slug).exists():
         slug = secrets.token_urlsafe(6)[:8]
+
+    # Connect to Redis for progress tracking
+    try:
+        redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379')
+        r_client = redis.Redis.from_url(redis_url)
+    except Exception:
+        r_client = None
+
+    def publish_progress(step, percent):
+        if r_client:
+            try:
+                r_client.publish(f"ingest:progress:{slug}", json.dumps({
+                    "step": step,
+                    "percent": percent
+                }))
+            except Exception as e:
+                print("Redis progress publish error:", e)
+
+    publish_progress("Extracting document content...", 10)
 
     # Calculate expiration
     expires_at = timezone.now() + timedelta(days=int(ttl_days))
@@ -67,19 +121,40 @@ def ingest_document(request):
             elif file_type == 'txt':
                 text = uploaded_file.read().decode('utf-8', errors='ignore')
                 pages_dict[1] = text
+            elif file_type == 'docx':
+                doc = docx.Document(uploaded_file)
+                # Map paragraphs to virtual pages (every 15 paragraphs = 1 page)
+                current_page = 1
+                para_count = 0
+                pages_dict[current_page] = ""
+                for para in doc.paragraphs:
+                    t = para.text.strip()
+                    if t:
+                        pages_dict[current_page] += t + "\n\n"
+                        para_count += 1
+                        if para_count >= 15:
+                            current_page += 1
+                            para_count = 0
+                            pages_dict[current_page] = ""
             else:
                 return Response({'error': f'Unsupported file type: {file_type}'}, status=status.HTTP_400_BAD_REQUEST)
     except Exception as e:
         return Response({'error': f'Failed to parse file or scrape URL: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
+
+    publish_progress("Structuring pages & layout...", 30)
 
     # Perform chunking
     chunks = chunk_text_by_pages(pages_dict)
     if not chunks:
         return Response({'error': 'No text could be extracted from the document'}, status=status.HTTP_400_BAD_REQUEST)
 
+    publish_progress(f"Segmenting text into {len(chunks)} chunks...", 45)
+
     # Temporary domain classification using the first chunk
     first_chunk_text = chunks[0]['text']
     detected_domain = classify_domain(first_chunk_text)
+
+    publish_progress("Classifying document domain & starter questions...", 55)
 
     # Save Capsule
     password = request.data.get('password', '').strip()
@@ -87,6 +162,13 @@ def ingest_document(request):
     logo_url = request.data.get('logo_url', '').strip()
     accent_color = request.data.get('accent_color', '').strip()
     title = request.data.get('title', '').strip() or file_name
+
+    # Reset file pointer to beginning if read
+    if uploaded_file:
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
 
     # Generate suggested starter questions based on the first chunk
     suggested_list = generate_suggested_questions(first_chunk_text)
@@ -100,7 +182,8 @@ def ingest_document(request):
         password_hash=password_hash,
         suggested_questions=suggested_json,
         custom_logo_url=logo_url,
-        custom_accent_color=accent_color
+        custom_accent_color=accent_color,
+        document_file=uploaded_file if not url_input else None
     )
 
     auth_header = request.headers.get('Authorization')
@@ -115,9 +198,15 @@ def ingest_document(request):
 
     # Save document chunks with embeddings using raw SQL to cast vector types explicitly
     try:
+        num_chunks = len(chunks)
         with connection.cursor() as cursor:
-            for chunk in chunks:
+            for idx, chunk in enumerate(chunks):
                 text_chunk = chunk['text']
+                
+                # Publish progress per chunk
+                percent = 60 + int((idx / num_chunks) * 30)
+                publish_progress(f"Embedding chunk {idx + 1} of {num_chunks}...", percent)
+                
                 # Generate embedding
                 embedding_vector = get_embedding(text_chunk)
                 # Format list of floats as a pgvector string representation: [x,y,z...]
@@ -132,6 +221,13 @@ def ingest_document(request):
         capsule.delete()
         return Response({'error': f'Failed to process and embed chunks: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    publish_progress("Ingestion complete!", 100)
+    if r_client:
+        try:
+            r_client.publish(f"ingest:progress:{slug}", "[DONE]")
+        except Exception:
+            pass
+
     return Response({
         'id': str(capsule.id),
         'slug': capsule.slug,
@@ -144,7 +240,7 @@ def ingest_document(request):
 @api_view(['POST'])
 @parser_classes([JSONParser])
 def search_capsule(request, slug):
-    if not is_internal_request(request):
+    if not is_internal_request(request, slug):
         return Response({'error': 'Unauthorized: Internal service authentication required.'}, status=status.HTTP_401_UNAUTHORIZED)
 
     capsule = get_object_or_404(Capsule, slug=slug)
@@ -245,13 +341,14 @@ def verify_capsule(request, slug):
         'verified': verified,
         'suggested_questions': suggested,
         'custom_logo_url': capsule.custom_logo_url,
-        'custom_accent_color': capsule.custom_accent_color
+        'custom_accent_color': capsule.custom_accent_color,
+        'document_url': request.build_absolute_uri(capsule.document_file.url) if capsule.document_file else None
     }, status=status.HTTP_200_OK)
 
 @api_view(['POST'])
 @parser_classes([JSONParser])
 def log_analytic(request, slug):
-    if not is_internal_request(request):
+    if not is_internal_request(request, slug):
         return Response({'error': 'Unauthorized: Internal service authentication required.'}, status=status.HTTP_401_UNAUTHORIZED)
 
     capsule = get_object_or_404(Capsule, slug=slug)

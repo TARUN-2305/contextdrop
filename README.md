@@ -6,18 +6,16 @@ ContextDrop transforms static documents (PDFs, TXT) and web links into interacti
 
 ---
 
-## 🚀 Product Vision & Core Concept
+## 🚀 Product Concept & Architecture
 
-When a user shares a document, they create a **Capsule**. A capsule represents a sandboxed RAG (Retrieval-Augmented Generation) context. 
+Every document or web link uploaded to ContextDrop is stored as a **Capsule**. 
 * **Zero-Friction Reader Access**: Readers do not need to sign up, download files, or create accounts. They click the link, and immediately get a clean, familiar, messaging-style chat interface.
 * **100% Grounded AI**: The AI is strictly sandboxed to the document. It does not hallucinate answers from external knowledge. If a question is not covered in the document, the AI explicitly states: *"This document doesn't cover that."*
 * **Verification and Traceability**: Inline, clickable page citations (e.g., `[Page 3, Excerpt]`) accompany every answer so readers can verify the source in seconds.
 
----
+### 🎨 Local Architecture & Tech Stack
 
-## 🎨 System Architecture & Tech Stack
-
-ContextDrop is a high-performance, three-tier full-stack application:
+ContextDrop is designed to run locally using a combination of local database volumes, local embedding execution, and cloud/local LLM generation:
 
 ```
 [ Creator Client ]                      [ Reader Client ]
@@ -32,111 +30,108 @@ ContextDrop is a high-performance, three-tier full-stack application:
   /api/user/capsules                 client connections
         │                                      │
         ▼                                      ▼
-[ Vector Similarity Engine ]            [ RAG Query Pipeline ]
-  1. Parse (Docling/PDFPlumber)          1. Embed user query
-  2. Text chunking & overlap             2. Retrieve top matching chunks
-  3. Semantic embeddings                 3. Inject into grounded LLM prompt
-  4. pgvector/SQLite search              4. Stream answer chunks via SSE
+[ pgvector Database (Docker) ]          [ RAG Query Pipeline ]
+  Stores chunks & embeddings             1. Embed user query via local Ollama
+  (Docker used for DB/Redis volumes)     2. Cosine similarity search (pgvector)
+                                         3. Inject chunks into RAG prompt
+                                         4. Stream answer via Groq (fallback Ollama)
 ```
 
-### Stack Breakdown
-1. **Frontend**: React (TypeScript) + Vite. Styled with vanilla CSS, custom variables, and dark-theme glassmorphism aesthetics. Supports dynamic branding configurations.
-2. **REST API Backend**: Django & Django REST Framework (DRF). Handles ingestion pipelines, user authentication, capsule CRUD, tag endpoints, and creator analytics calculations.
-3. **SSE Server**: Node.js & Express. Designed to handle long-running HTTP connections for Server-Sent Events (SSE), streaming LLM responses to the client chunk-by-chunk with zero lag.
-4. **Vector Search & Grounding**: Ingestion breaks documents into overlapping chunks, stores embeddings, and queries them using local semantic similarity search.
-5. **Caching & Expiring (Redis)**: Tracks capsule sessions, enforces rate-limiting per reader IP, and manages the Link Time-To-Live (TTL) expiry.
+1. **Frontend**: React (TypeScript) + Vite running at `http://localhost:5173`. Styled with luxury dark-theme glassmorphism and supporting dynamic accent colors and logos.
+2. **REST API Backend**: Django & Django REST Framework (DRF) running at `http://localhost:8000`. Handles ingestion pipelines, user auth, capsule CRUD, tag endpoints, and creator analytics.
+3. **SSE Server**: Node.js & Express running at `http://localhost:4000`. Streams LLM responses to the client chunk-by-chunk using Server-Sent Events (SSE).
+4. **Vector Database**: PostgreSQL with the `pgvector` extension running inside a **local Docker container** (used strictly to host persistent volumes for Postgres and Redis).
+   > [!WARNING]
+   > **Vector Dimensions Constraint**: Once the database column `embedding` is created with a specific size (e.g. `dimensions=768` for Nomic), it cannot be altered to a different size (e.g. `1536` for OpenAI) without dropping and recreating the column or table. Changing embedding providers will require database migration steps (dropping/recreating the chunk tables).
+
+5. **Embedding Engine**: Local **Ollama** running `nomic-embed-text` (768 dimensions) to embed document chunks and user queries.
+6. **LLM Generation**: **Groq Cloud API** (`llama-3.3-70b-versatile`) acts as the primary chat engine, falling back to local **Ollama** (`gemma4:e2b`) if offline or Groq is unreachable.
 
 ---
 
-## ⚡ Comprehensive Feature Guide
-
-Here is a detailed breakdown of each individual feature on the ContextDrop platform:
+## ⚡ Feature Guide
 
 ### 1. Document Upload & Drop Zone
-* **Drag-and-Drop Ingestion**: Drop files directly into the interactive drop zone or click to select them from the file explorer.
-* **Supported Formats**: Accepts PDF and TXT files (supporting up to 50MB files).
-* **Chunking Pipeline**: Files are processed using a structural parser, split into token chunks with a 20% overlap to ensure context is never lost across chunk boundaries, embedded, and indexed for similarity lookup.
+* **Drag-and-Drop Ingestion**: Drop PDF or TXT files (up to 50MB) directly into the upload card.
+* **Layout Parsing & Chunks**: Files are parsed, split into token chunks with a 20% overlap, embedded via local Ollama, and stored in the PostgreSQL database.
 
 ### 2. Web Link Scraper / Ingest
-* **URL-Based Capsules**: Switch to the "Paste Web Link" tab to scrape online articles, documentation pages, or wiki articles (e.g., fandom pages, blog posts).
-* **Auto-Scraper**: Ingests raw HTML, cleans scripts and styles, and converts readable text blocks into chunks, letting readers chat with web content as easily as a PDF.
+* **Web Scraping**: Paste any web article URL (e.g. blog post or wiki page). The backend scrapes raw HTML, cleans up scripts, extracts text content, and indexes it.
 
 ### 3. Capsule Title (Custom Naming)
-* **Creator Customization**: Add a descriptive name in the *Capsule Title (Optional)* field before ingestion.
-* **Global Dashboard Organization**: Instead of identifying capsules solely by random short-slug IDs (e.g., `d/m_dmcL69`), custom titles are tracked and displayed on your dashboard for quick reference.
+* **Custom Names**: Set a custom name for capsules before ingestion, allowing you to organize and search them in your global dashboard.
 
 ### 4. Link Expiration (TTL Control)
-* **Self-Deleting Content**: Enforce security by setting link lifespans. Options include **24 Hours**, **7 Days**, or **30 Days**.
-* **Automatic Expiry**: Once the TTL expires, the capsule data is marked as expired, and all index files/records are deleted. Readers trying to access it will see a *"Capsule Expired"* screen.
+* **TTL Controls**: Set capsules to expire after **24 Hours**, **7 Days**, or **30 Days**. Expired capsules and their chunks are automatically deleted.
 
 ### 5. White-Labeling & Custom Branding
-* **Custom Logo URL**: Provide a URL for a custom icon/logo (PNG/SVG). It will dynamically replace the default ContextDrop logo in the reader's chat header.
-* **Custom Accent Color**: Enter a HEX code or use the color-picker input. The application dynamically overrides the CSS custom properties (`--accent-color` and `--accent-hover`) for that specific capsule, custom styling all button elements, active states, tags, and highlights to match the creator's brand identity.
+* **Custom Logos**: Provide a URL for a custom logo dynamically loaded in the reader's chat header.
+* **Accent Color Selector**: Choose a HEX color or pick one from the color picker to dynamically restyle the entire page (buttons, tags, and highlights) to match your custom brand.
 
 ### 6. Security (Password Lock)
-* **Access Restrictions**: Restrict document access by inputting a password.
-* **Reader Gate**: Readers opening the shared link will encounter a lock screen requiring the password. Correct verification stores a local access session, allowing access to the Q&A session.
+* **Access Control**: Secure capsules with a password. Readers must input the correct password to unlock and chat with the document.
 
 ### 7. Automated Domain Classification
-* **Zero-Shot Classifier**: On ingestion, the backend analyzes the document structure and vocabulary to classify it into a specific domain (e.g., **Academic**, **Legal**, **Medical**, **Technical**, **Business**, or **General**).
-* **Dynamic AI Tone**: The domain is passed to the LLM agent system-prompt, adjusting the vocabulary and formality of the response.
+* **Domain Classifier**: On ingestion, the backend classifies the document into a domain (e.g., **Academic**, **Legal**, **Medical**, **Technical**, **Business**, or **General**) to adjust the AI's vocabulary and tone.
 
-### 8. Interactive Reader Chat Pane
-* **Suggested Starter Questions**: On initial load, the chat presents 3–5 automatically generated questions based on the document's content, guiding the reader on where to begin.
-* **Streaming Chat**: Utilizes Server-Sent Events (SSE) to render answers in real-time, word-by-word.
-* **Voice Input (Web Speech API)**: Click the microphone icon next to the chat bar to dictate questions hands-free. Supported across modern browsers.
+### 8. Interactive Chat & Citation Chips
+* **Suggested Starter Questions**: Dynamic suggested prompts appear on initial chat load.
+* **Streaming SSE Chat**: Streams tokens word-by-word with zero delay.
+* **Tappable Citation Chips**: Real citations (like `[Page 4, Section 2.1]`) are parsed and rendered as clickable tags in the `IBM Plex Mono` font.
+* **Voice Input (Web Speech API)**: Click the microphone icon to dictate questions hands-free.
 
-### 9. Grounded RAG with Inline Citations
-* **Hallucination Sandbox**: Ensures the assistant only answers questions using retrieved excerpts. Questions not answerable by the text trigger a standardized fallback to prevent hallucinations.
-* **Inline Reference Citations**: Answers contain click-to-verify citations (e.g. `[Page 1, Excerpt]`), allowing readers to inspect the source material.
+### 9. Embed Widget (Iframe)
+* **Embed Mode**: Append `?embed=true` to any capsule URL to load the widget mode, hiding headers and nav links for embedding in other blogs or documentation portals.
 
-### 10. QR Code Sharing
-* **Mobile Ready**: The Ready page renders a high-quality QR code. Scanning it with a mobile device instantly loads the reader interface.
+### 10. Deep Analytics Dashboard
+* **Metrics Cards**: Logs *Total Questions*, *Answered Queries*, and *Unanswered Queries (Gaps)*.
+* **Query Heatmap**: Bar chart indicating which document pages are queried most frequently.
+* **Reader Gaps Log**: Exact log of questions readers asked that the AI couldn't answer, exposing content gaps in your source document.
 
-### 11. Iframe Chat Widget Embedding
-* **Embedded Integration**: Generate iframe snippet code:
-  ```html
-  <iframe src="http://localhost:5173/d/[slug]?embed=true" width="100%" height="600" style="border:1px solid rgba(255,255,255,0.08); border-radius:12px; background:transparent;"></iframe>
-  ```
-* **Embed Mode Layout**: Adding `?embed=true` automatically hides the application header, navigation links, and back buttons, providing a clean, compact widget suited for blog posts or documentation portals.
-
-### 12. Single Capsule Dashboard (Analytics)
-* **Analytics Cards**: Displays key metrics including *Total Questions*, *Answered Queries*, and *Unanswered Queries (Gaps)*.
-* **Query Heatmap**: Renders a bar chart representing which pages or segments of the document readers target most frequently.
-* **Reader Gaps Log (Unanswered Questions)**: Lists queries that returned a gap warning. This helps creators identify missing details in their original source document.
-
-### 13. User Authentication
-* **Creator Workspace**: Register or log in to access the multi-capsule manager. Authenticated sessions are persisted using token headers.
-
-### 14. Global Dashboard ("My Capsules")
-* **Unified Management**: Lists all capsules created under the authenticated user.
-* **Tag Management**: 
-  - **Add Tags**: Type in a tag name and hit `Enter` to label capsules (e.g. `#legal`, `#marketing`).
-  - **Remove Tags**: Click the `×` button next to any tag to immediately delete it.
+### 11. Creator Workspace (Global Dashboard)
+* **Multi-Capsule Manager**: Persists your created capsules under your user account.
+* **Tag Management**: Add custom tags (`#tags`) and remove tags dynamically using the `×` button.
 
 ---
 
-## 🛠️ Setup & Development Guide
+## 🛠️ Local Setup & Development Guide
 
-Follow these steps to run ContextDrop locally on your machine.
+Follow these steps to run the complete stack locally on your machine.
 
 ### Prerequisites
 * Python 3.10+
 * Node.js 18+
-* Git
-* Virtualenv
+* Docker Desktop (running)
+* Ollama installed and running (`ollama serve`)
 
 ---
 
-### Step 1: Clone & Configure Remote
-Ensure your local workspace is linked to the correct repository:
+### Step 1: Start Docker Volumes (DB & Redis)
+In the root directory of the project, start PostgreSQL and Redis:
 ```bash
-git remote add chad https://github.com/Chad-di-Bear/contextdrop.git
+docker-compose up -d
+```
+Verify the containers are running:
+```bash
+docker ps
+```
+*(Should list `contextdrop-db-1` on port 5432 and `contextdrop-redis-1` on port 6379).*
+
+---
+
+### Step 2: Setup Ollama Local Models
+Open a terminal and download the local embedding and fallback chat models:
+```bash
+# Pull the 768-dimension embedding model
+ollama pull nomic-embed-text
+
+# Pull the fallback chat model
+ollama pull gemma4:e2b
 ```
 
 ---
 
-### Step 2: Backend Setup (Django REST API)
+### Step 3: Run Django Backend REST API
 1. Navigate to the backend directory:
    ```bash
    cd backend
@@ -144,36 +139,34 @@ git remote add chad https://github.com/Chad-di-Bear/contextdrop.git
 2. Create and activate a Python virtual environment:
    ```bash
    python -m venv .venv
-   # On Windows:
+   # Windows:
    .venv\Scripts\activate
-   # On macOS/Linux:
+   # macOS/Linux:
    source .venv/bin/activate
    ```
 3. Install dependencies:
    ```bash
-   pip install -r requirements.txt
+   python -m pip install -r requirements.txt
    ```
-4. Configure environment variables in `backend/contextdrop/.env`:
-   ```env
-   SECRET_KEY=your-django-secret-key
-   DEBUG=True
-   ALLOWED_HOSTS=localhost,127.0.0.1
-   OPENAI_API_KEY=your-openai-api-key # Or GROQ_API_KEY / OLLAMA_HOST
+4. Copy the environment configuration template to create `.env`:
+   ```bash
+   cp .env.example .env
    ```
-5. Apply database migrations:
+   Open `backend/.env` in your editor and configure your variables (e.g. fill in your `GROQ_API_KEY` from https://console.groq.com/). See [backend/.env.example](file:///C:/Users/tarun/Desktop/USEFUL/Projects/ContextDrop%20-%20copy/ContextDrop/backend/.env.example) for details on each key.
+5. Run migrations:
    ```bash
    python manage.py makemigrations
    python manage.py migrate
    ```
-6. Start the server:
+6. Start the API server:
    ```bash
    python manage.py runserver
    ```
-   The backend will be available at `http://localhost:8000`.
+   *Available at `http://localhost:8000`.*
 
 ---
 
-### Step 3: SSE Server Setup (Node.js)
+### Step 4: Run Node.js SSE Streaming Server
 1. Navigate to the SSE server directory:
    ```bash
    cd sse-server
@@ -182,15 +175,15 @@ git remote add chad https://github.com/Chad-di-Bear/contextdrop.git
    ```bash
    npm install
    ```
-3. Start the node server:
+3. Start the server:
    ```bash
    node index.js
    ```
-   The streaming server will be available at `http://localhost:4000`.
+   *Available at `http://localhost:4000`.*
 
 ---
 
-### Step 4: Frontend Setup (React & Vite)
+### Step 5: Run React Frontend Client
 1. Navigate to the frontend directory:
    ```bash
    cd frontend
@@ -199,26 +192,50 @@ git remote add chad https://github.com/Chad-di-Bear/contextdrop.git
    ```bash
    npm install
    ```
-3. Configure environment variables in `frontend/.env.local`:
-   ```env
-   VITE_API_URL=http://localhost:8000
-   VITE_SSE_URL=http://localhost:4000
-   VITE_APP_URL=http://localhost:5173
+3. Copy the environment configuration template to create `.env.local`:
+   ```bash
+   cp .env.example .env.local
    ```
-4. Start the frontend development server:
+   Open `frontend/.env.local` in your editor and adjust service ports if you are running services on custom local addresses. See [frontend/.env.example](file:///C:/Users/tarun/Desktop/USEFUL/Projects/ContextDrop%20-%20copy/ContextDrop/frontend/.env.example) for details.
+4. Start the Vite server:
    ```bash
    npm run dev
    ```
-   Open `http://localhost:5173` in your browser.
+   *Open `http://localhost:5173` in your browser.*
 
 ---
 
-## 🔗 How Embedding Works (Integration Walkthrough)
+## 🧹 Wiping the System Clean (Fresh Start)
 
-To verify the embed integration:
-1. Open the [embed_test/index.html](file:///C:/Users/tarun/Desktop/USEFUL/Projects/ContextDrop%20-%20copy/ContextDrop/embed_test/index.html) file.
-2. In it, the capsule viewer is loaded inside an `iframe`:
-   ```html
-   <iframe src="http://localhost:5173/d/[slug]?embed=true" width="100%" height="600" style="border:1px solid rgba(0,0,0,0.1); border-radius:12px; background:transparent;"></iframe>
+If you want to clear all data and start with a fresh slate (deleting all created capsules, user accounts, analytics, and stored media files):
+
+1. **Flush Database Records**:
+   Run the Django clean flush command inside the `backend` virtual environment:
+   ```bash
+   python manage.py flush --no-input
    ```
-3. Serving this page on a local web server (e.g. `python -m http.server 8080` in `embed_test/`) allows testing how external websites embed the chat widget.
+2. **Clear Uploaded Documents**:
+   Remove all document files from media storage (run from project root):
+   * **Windows (PowerShell)**:
+     ```powershell
+     Remove-Item -Path "backend/media/capsules/*" -Force -Recurse -ErrorAction SilentlyContinue
+     ```
+   * **macOS/Linux**:
+     ```bash
+     rm -rf backend/media/capsules/*
+     ```
+3. **Reset Redis Cache & Rates**:
+   Wipe the local Redis cache database (run from project root):
+   ```bash
+   docker exec contextdrop-redis-1 redis-cli flushall
+   ```
+
+---
+
+## 🔗 Widget Embedding Example
+A test index file showing how to embed a capsule widget is located in `embed_test/index.html`. You can run a quick server inside the `embed_test` folder to view it:
+```bash
+cd embed_test
+python -m http.server 8080
+```
+Then visit `http://localhost:8080` in your web browser.

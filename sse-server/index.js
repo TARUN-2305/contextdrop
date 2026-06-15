@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const { createClient } = require('redis');
+const crypto = require('crypto');
 
 // Load environment variables from backend/.env
 require('dotenv').config({ path: path.join(__dirname, '../backend/.env') });
@@ -10,6 +11,20 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || 'default-internal-secret-key-12345';
 const DJANGO_API_URL = process.env.DJANGO_API_URL || 'http://localhost:8000';
+
+// Cryptographic signing helper for secure service-to-service communication
+function getSignatureHeaders(slug) {
+  const timestamp = Date.now().toString();
+  // Support comma-separated keys for rotation. Use the first key in the list.
+  const primaryKey = INTERNAL_API_KEY.split(',')[0].trim();
+  const signature = crypto.createHmac('sha256', primaryKey)
+                          .update(timestamp + slug)
+                          .digest('hex');
+  return {
+    'X-Signature': signature,
+    'X-Timestamp': timestamp
+  };
+}
 
 app.use(cors());
 app.use(express.json());
@@ -91,7 +106,8 @@ app.get('/stream/:slug', async (req, res) => {
       method: 'POST',
       headers: { 
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${INTERNAL_API_KEY}`
+        'Authorization': `Bearer ${INTERNAL_API_KEY}`,
+        ...getSignatureHeaders(slug)
       },
       body: JSON.stringify({ question, password })
     });
@@ -293,7 +309,8 @@ function logAnalyticsHelper(slug, question, chunksData, fullReply) {
     method: 'POST',
     headers: { 
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${INTERNAL_API_KEY}`
+      'Authorization': `Bearer ${INTERNAL_API_KEY}`,
+      ...getSignatureHeaders(slug)
     },
     body: JSON.stringify({
       question,
@@ -310,6 +327,55 @@ function logAnalyticsHelper(slug, question, chunksData, fullReply) {
   }).catch(err => console.error('Failed to log analytic to Django:', err.message));
 }
 
+// Ingestion SSE Stream Endpoint
+app.get('/stream/ingest/:slug', async (req, res) => {
+  const { slug } = req.params;
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+
+  const subscriber = redisClient.duplicate();
+  let isClosed = false;
+
+  const cleanup = async () => {
+    if (isClosed) return;
+    isClosed = true;
+    try {
+      await subscriber.unsubscribe();
+      await subscriber.quit();
+    } catch (err) {
+      // ignore
+    }
+  };
+  
+  try {
+    await subscriber.connect();
+    
+    await subscriber.subscribe(`ingest:progress:${slug}`, (message) => {
+      if (message === '[DONE]') {
+        res.write(`data: [DONE]\n\n`);
+        cleanup();
+        res.end();
+      } else {
+        res.write(`data: ${message}\n\n`);
+      }
+    });
+
+    req.on('close', () => {
+      cleanup();
+    });
+  } catch (err) {
+    console.error('Redis subscription failed for ingestion progress:', err.message);
+    res.write(`data: ${JSON.stringify({ step: "Ingestion progress unavailable (Redis subscription error)", percent: 50 })}\n\n`);
+    res.write(`data: [DONE]\n\n`);
+    res.end();
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`SSE Server running on port ${PORT}`);
 });
+
